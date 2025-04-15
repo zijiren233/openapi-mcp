@@ -10,10 +10,7 @@ import (
 )
 
 type ConvertOptions struct {
-	ServerName     string
-	Version        string
 	ToolNamePrefix string
-	TemplatePath   string
 }
 
 // Converter represents an OpenAPI to MCP converter
@@ -24,11 +21,6 @@ type Converter struct {
 
 // NewConverter creates a new OpenAPI to MCP converter
 func NewConverter(parser *Parser, options ConvertOptions) *Converter {
-	// Set default values if not provided
-	if options.ServerName == "" {
-		options.ServerName = "openapi-server"
-	}
-
 	return &Converter{
 		parser:  parser,
 		options: options,
@@ -41,10 +33,15 @@ func (c *Converter) Convert() (*server.MCPServer, error) {
 		return nil, errors.New("no OpenAPI document loaded")
 	}
 
+	info := c.parser.GetInfo()
+	if info == nil {
+		return nil, errors.New("no info found in OpenAPI document")
+	}
+
 	// Create the MCP configuration
 	server := server.NewMCPServer(
-		c.options.ServerName,
-		c.options.Version,
+		info.Title,
+		info.Version,
 	)
 
 	// Process each path and operation
@@ -107,6 +104,32 @@ func (c *Converter) convertOperation(path, method string, operation *openapi3.Op
 		return nil, fmt.Errorf("failed to convert parameters: %w", err)
 	}
 
+	// Handle request body if present
+	// if operation.RequestBody != nil && operation.RequestBody.Value != nil {
+	// 	bodyArgs, err := c.convertRequestBody(operation.RequestBody.Value)
+	// 	if err != nil {
+	// 		return nil, fmt.Errorf("failed to convert request body: %w", err)
+	// 	}
+	// 	args = append(args, bodyArgs...)
+	// }
+
+	// Add server address parameter
+	servers := c.parser.GetServers()
+	if len(servers) == 0 {
+		args = append(args, mcp.WithString("openapi_server_addr",
+			mcp.Description("Server address to connect to"),
+			mcp.Required()))
+	} else if len(servers) != 1 {
+		serverUrls := make([]string, 0, len(servers))
+		for _, server := range servers {
+			serverUrls = append(serverUrls, server.URL)
+		}
+		args = append(args, mcp.WithString("openapi_server_addr",
+			mcp.Description("Server address to connect to"),
+			mcp.Required(),
+			mcp.Enum(serverUrls...)))
+	}
+
 	args = append(args, mcp.WithDescription(getDescription(operation)))
 
 	tool := mcp.NewTool(toolName,
@@ -114,6 +137,54 @@ func (c *Converter) convertOperation(path, method string, operation *openapi3.Op
 	)
 
 	return &tool, nil
+}
+
+// convertRequestBody converts an OpenAPI request body to MCP arguments
+func (c *Converter) convertRequestBody(requestBody *openapi3.RequestBody) ([]mcp.ToolOption, error) {
+	args := []mcp.ToolOption{}
+
+	for contentType, mediaType := range requestBody.Content {
+		if mediaType.Schema == nil || mediaType.Schema.Value == nil {
+			continue
+		}
+
+		schema := mediaType.Schema.Value
+		propertyOptions := []mcp.PropertyOption{}
+
+		if requestBody.Description != "" {
+			propertyOptions = append(propertyOptions, mcp.Description(requestBody.Description))
+		}
+
+		if requestBody.Required {
+			propertyOptions = append(propertyOptions, mcp.Required())
+		}
+
+		t := PropertyTypeObject
+		if schema.Type != nil {
+			if schema.Type.Is("array") && schema.Items != nil && schema.Items.Value != nil {
+				t = PropertyTypeArray
+				item := c.processSchemaItems(schema.Items.Value)
+				propertyOptions = append(propertyOptions, mcp.Items(item))
+			} else if schema.Type.Is("object") || len(schema.Properties) > 0 {
+				obj := c.processSchemaProperties(schema)
+				propertyOptions = append(propertyOptions, mcp.Properties(obj))
+			} else if schema.Type.Is("string") {
+				t = PropertyTypeString
+			} else if schema.Type.Is("integer") {
+				t = PropertyTypeInteger
+			} else if schema.Type.Is("number") {
+				t = PropertyTypeNumber
+			} else if schema.Type.Is("boolean") {
+				t = PropertyTypeBoolean
+			}
+		}
+
+		// Add content type as part of the parameter name
+		paramName := "body|" + contentType
+		args = append(args, c.createToolOption(t, paramName, propertyOptions...))
+	}
+
+	return args, nil
 }
 
 type propertyType string
@@ -177,7 +248,10 @@ func (c *Converter) convertParameters(parameters openapi3.Parameters) ([]mcp.Too
 // processSchemaItems processes schema items for array types
 func (c *Converter) processSchemaItems(schema *openapi3.Schema) map[string]interface{} {
 	item := make(map[string]interface{})
-	item["type"] = schema.Type
+
+	if schema.Type != nil {
+		item["type"] = schema.Type
+	}
 
 	if schema.Description != "" {
 		item["description"] = schema.Description
@@ -192,6 +266,11 @@ func (c *Converter) processSchemaItems(schema *openapi3.Schema) map[string]inter
 			}
 		}
 		item["properties"] = properties
+	}
+
+	// Handle reference if this is a reference to another schema
+	if schema.Items != nil && schema.Items.Value != nil {
+		item["items"] = c.processSchemaItems(schema.Items.Value)
 	}
 
 	return item
@@ -213,13 +292,23 @@ func (c *Converter) processSchemaProperties(schema *openapi3.Schema) map[string]
 // processSchemaProperty processes a single schema property
 func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]interface{} {
 	property := make(map[string]interface{})
-	property["type"] = schema.Type
 
+	if schema.Type != nil {
+		property["type"] = schema.Type
+	}
+
+	// Basic metadata
+	if schema.Title != "" {
+		property["title"] = schema.Title
+	}
 	if schema.Description != "" {
 		property["description"] = schema.Description
 	}
 	if schema.Default != nil {
 		property["default"] = schema.Default
+	}
+	if schema.Example != nil {
+		property["example"] = schema.Example
 	}
 	if len(schema.Enum) > 0 {
 		property["enum"] = schema.Enum
@@ -227,33 +316,134 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 	if schema.Format != "" {
 		property["format"] = schema.Format
 	}
+
+	// Schema composition
+	if len(schema.OneOf) > 0 {
+		oneOf := make([]interface{}, 0, len(schema.OneOf))
+		for _, schemaRef := range schema.OneOf {
+			if schemaRef.Value != nil {
+				oneOf = append(oneOf, c.processSchemaProperty(schemaRef.Value))
+			}
+		}
+		if len(oneOf) > 0 {
+			property["oneOf"] = oneOf
+		}
+	}
+
+	if len(schema.AnyOf) > 0 {
+		anyOf := make([]interface{}, 0, len(schema.AnyOf))
+		for _, schemaRef := range schema.AnyOf {
+			if schemaRef.Value != nil {
+				anyOf = append(anyOf, c.processSchemaProperty(schemaRef.Value))
+			}
+		}
+		if len(anyOf) > 0 {
+			property["anyOf"] = anyOf
+		}
+	}
+
+	if len(schema.AllOf) > 0 {
+		allOf := make([]interface{}, 0, len(schema.AllOf))
+		for _, schemaRef := range schema.AllOf {
+			if schemaRef.Value != nil {
+				allOf = append(allOf, c.processSchemaProperty(schemaRef.Value))
+			}
+		}
+		if len(allOf) > 0 {
+			property["allOf"] = allOf
+		}
+	}
+
+	if schema.Not != nil && schema.Not.Value != nil {
+		property["not"] = c.processSchemaProperty(schema.Not.Value)
+	}
+
+	// Boolean flags
+	if schema.Nullable {
+		property["nullable"] = schema.Nullable
+	}
+	if schema.ReadOnly {
+		property["readOnly"] = schema.ReadOnly
+	}
+	if schema.WriteOnly {
+		property["writeOnly"] = schema.WriteOnly
+	}
+	if schema.Deprecated {
+		property["deprecated"] = schema.Deprecated
+	}
+	if schema.AllowEmptyValue {
+		property["allowEmptyValue"] = schema.AllowEmptyValue
+	}
+	if schema.UniqueItems {
+		property["uniqueItems"] = schema.UniqueItems
+	}
+	if schema.ExclusiveMin {
+		property["exclusiveMinimum"] = schema.ExclusiveMin
+	}
+	if schema.ExclusiveMax {
+		property["exclusiveMaximum"] = schema.ExclusiveMax
+	}
+
+	// Number validations
 	if schema.Min != nil {
-		property["min"] = schema.Min
+		property["minimum"] = *schema.Min
 	}
 	if schema.Max != nil {
-		property["max"] = schema.Max
+		property["maximum"] = *schema.Max
 	}
+	if schema.MultipleOf != nil {
+		property["multipleOf"] = *schema.MultipleOf
+	}
+
+	// String validations
 	if schema.MinLength != 0 {
 		property["minLength"] = schema.MinLength
 	}
 	if schema.MaxLength != nil {
 		property["maxLength"] = *schema.MaxLength
 	}
+	if schema.Pattern != "" {
+		property["pattern"] = schema.Pattern
+	}
+
+	// Array validations
 	if schema.MinItems != 0 {
 		property["minItems"] = schema.MinItems
 	}
 	if schema.MaxItems != nil {
 		property["maxItems"] = *schema.MaxItems
 	}
+
+	// Object validations
 	if schema.MinProps != 0 {
 		property["minProperties"] = schema.MinProps
 	}
 	if schema.MaxProps != nil {
 		property["maxProperties"] = *schema.MaxProps
 	}
+	if len(schema.Required) > 0 {
+		property["required"] = schema.Required
+	}
+
+	// Handle AdditionalProperties
+	if schema.AdditionalProperties.Has != nil {
+		property["additionalProperties"] = *schema.AdditionalProperties.Has
+	} else if schema.AdditionalProperties.Schema != nil && schema.AdditionalProperties.Schema.Value != nil {
+		property["additionalProperties"] = c.processSchemaProperty(schema.AdditionalProperties.Schema.Value)
+	}
+
+	// Handle discriminator
+	if schema.Discriminator != nil {
+		discriminator := make(map[string]interface{})
+		discriminator["propertyName"] = schema.Discriminator.PropertyName
+		if len(schema.Discriminator.Mapping) > 0 {
+			discriminator["mapping"] = schema.Discriminator.Mapping
+		}
+		property["discriminator"] = discriminator
+	}
 
 	// Recursively process nested objects
-	if schema.Type.Is("object") && len(schema.Properties) > 0 {
+	if schema.Type != nil && schema.Type.Is("object") && len(schema.Properties) > 0 {
 		nestedProps := make(map[string]interface{})
 		for propName, propRef := range schema.Properties {
 			if propRef.Value != nil {
@@ -264,8 +454,37 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 	}
 
 	// Recursively process array items
-	if schema.Type.Is("array") && schema.Items != nil && schema.Items.Value != nil {
+	if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil && schema.Items.Value != nil {
 		property["items"] = c.processSchemaItems(schema.Items.Value)
+	}
+
+	// Handle external docs if present
+	if schema.ExternalDocs != nil {
+		externalDocs := make(map[string]interface{})
+		if schema.ExternalDocs.Description != "" {
+			externalDocs["description"] = schema.ExternalDocs.Description
+		}
+		if schema.ExternalDocs.URL != "" {
+			externalDocs["url"] = schema.ExternalDocs.URL
+		}
+		property["externalDocs"] = externalDocs
+	}
+
+	// Handle XML object if present
+	if schema.XML != nil {
+		xml := make(map[string]interface{})
+		if schema.XML.Name != "" {
+			xml["name"] = schema.XML.Name
+		}
+		if schema.XML.Namespace != "" {
+			xml["namespace"] = schema.XML.Namespace
+		}
+		if schema.XML.Prefix != "" {
+			xml["prefix"] = schema.XML.Prefix
+		}
+		xml["attribute"] = schema.XML.Attribute
+		xml["wrapped"] = schema.XML.Wrapped
+		property["xml"] = xml
 	}
 
 	return property
@@ -276,7 +495,9 @@ func (c *Converter) createToolOption(t propertyType, name string, options ...mcp
 	switch t {
 	case PropertyTypeString:
 		return mcp.WithString(name, options...)
-	case PropertyTypeInteger, PropertyTypeNumber:
+	case PropertyTypeInteger:
+		return mcp.WithNumber(name, options...)
+	case PropertyTypeNumber:
 		return mcp.WithNumber(name, options...)
 	case PropertyTypeBoolean:
 		return mcp.WithBoolean(name, options...)

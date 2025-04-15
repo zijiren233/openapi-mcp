@@ -99,12 +99,6 @@ func (p *Parser) GetInfo() *openapi3.Info {
 	return p.doc.Info
 }
 
-// isJSON checks if the data is in JSON format
-func isJSON(data []byte) bool {
-	var js json.RawMessage
-	return json.Unmarshal(data, &js) == nil
-}
-
 // GetOperationID generates an operation ID if one is not provided
 func (p *Parser) GetOperationID(path string, method string, operation *openapi3.Operation) string {
 	if operation.OperationID != "" {
@@ -115,7 +109,9 @@ func (p *Parser) GetOperationID(path string, method string, operation *openapi3.
 	pathParts := strings.Split(strings.Trim(path, "/"), "/")
 	var pathName string
 	if len(pathParts) > 0 {
-		pathName = pathParts[len(pathParts)-1]
+		pathName = strings.Join(pathParts, "_")
+		pathName = strings.ReplaceAll(pathName, "{", "")
+		pathName = strings.ReplaceAll(pathName, "}", "")
 	} else {
 		pathName = "root"
 	}

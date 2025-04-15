@@ -12,13 +12,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to parse OpenAPI document: %v", err)
 	}
-	converter := NewConverter(parser, ConvertOptions{
-		ServerName: "openapi-server",
-		Version:    "1.0.0",
-	})
+	converter := NewConverter(parser, ConvertOptions{})
 	s, err := converter.Convert()
 	if err != nil {
 		log.Fatalf("Failed to convert OpenAPI to MCP: %v", err)
 	}
-	server.ServeStdio(s)
+	server.NewSSEServer(s).Start("127.0.0.1:3001")
 }
