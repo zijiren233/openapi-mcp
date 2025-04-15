@@ -8,7 +8,7 @@ import (
 
 func main() {
 	parser := NewParser()
-	err := parser.ParseFile("doc.json")
+	err := parser.ParseFileV2("doc.json")
 	if err != nil {
 		log.Fatalf("Failed to parse OpenAPI document: %v", err)
 	}

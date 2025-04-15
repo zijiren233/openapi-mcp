@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -52,7 +55,10 @@ func (c *Converter) Convert() (*server.MCPServer, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to convert operation %s %s: %w", method, path, err)
 			}
-			server.AddTool(*tool, nil)
+
+			server.AddTool(*tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return nil, nil
+			})
 		}
 	}
 
@@ -105,13 +111,13 @@ func (c *Converter) convertOperation(path, method string, operation *openapi3.Op
 	}
 
 	// Handle request body if present
-	// if operation.RequestBody != nil && operation.RequestBody.Value != nil {
-	// 	bodyArgs, err := c.convertRequestBody(operation.RequestBody.Value)
-	// 	if err != nil {
-	// 		return nil, fmt.Errorf("failed to convert request body: %w", err)
-	// 	}
-	// 	args = append(args, bodyArgs...)
-	// }
+	if operation.RequestBody != nil && operation.RequestBody.Value != nil {
+		bodyArgs, err := c.convertRequestBody(operation.RequestBody.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert request body: %w", err)
+		}
+		args = append(args, bodyArgs...)
+	}
 
 	// Add server address parameter
 	servers := c.parser.GetServers()
@@ -130,13 +136,145 @@ func (c *Converter) convertOperation(path, method string, operation *openapi3.Op
 			mcp.Enum(serverUrls...)))
 	}
 
-	args = append(args, mcp.WithDescription(getDescription(operation)))
+	// Handle security requirements if present and enabled
+	if operation.Security != nil && len(*operation.Security) > 0 {
+		securityArgs := c.convertSecurityRequirements(*operation.Security)
+		args = append(args, securityArgs...)
+	}
+
+	// Create description that includes summary, description, and response information
+	description := getDescription(operation)
+
+	// Add response information to description
+	if operation.Responses != nil {
+		responseDesc := c.generateResponseDescription(*operation.Responses)
+		if responseDesc != "" {
+			description += "\n\nResponses:\n\n" + responseDesc
+		}
+	}
+
+	args = append(args, mcp.WithDescription(description))
 
 	tool := mcp.NewTool(toolName,
 		args...,
 	)
 
 	return &tool, nil
+}
+
+// generateResponseDescription creates a human-readable description of possible responses
+func (c *Converter) generateResponseDescription(responses openapi3.Responses) string {
+	respMap := responses.Map()
+	responseDescriptions := make([]string, 0, len(respMap))
+
+	for code, responseRef := range respMap {
+		if responseRef == nil || responseRef.Value == nil {
+			continue
+		}
+
+		response := responseRef.Value
+		desc := fmt.Sprintf("- status: %s, description: %s", code, *response.Description)
+
+		fmt.Printf("response: %+v\n", response)
+
+		rawSchema, ok := response.Extensions["schema"].(map[string]interface{})
+		if ok && len(rawSchema) > 0 {
+			jsonStr, err := json.Marshal(rawSchema)
+			if err != nil {
+				continue
+			}
+			schema := openapi3.Schema{}
+			err = json.Unmarshal(jsonStr, &schema)
+			if err != nil {
+				continue
+			}
+
+			property := c.processSchemaProperty(&schema)
+			str, err := json.Marshal(property)
+			if err != nil {
+				continue
+			}
+			desc += fmt.Sprintf(", schema: %s", str)
+		}
+
+		if len(response.Content) > 0 {
+			for contentType, mediaType := range response.Content {
+				if mediaType.Schema != nil && mediaType.Schema.Value != nil {
+					property := c.processSchemaProperty(mediaType.Schema.Value)
+					str, err := json.Marshal(property)
+					if err != nil {
+						continue
+					}
+					desc += fmt.Sprintf(", content type: %s, schema: %s", contentType, str)
+				}
+			}
+		}
+
+		responseDescriptions = append(responseDescriptions, desc)
+	}
+
+	return strings.Join(responseDescriptions, "\n\n")
+}
+
+// convertSecurityRequirements converts OpenAPI security requirements to MCP arguments
+func (c *Converter) convertSecurityRequirements(securityRequirements openapi3.SecurityRequirements) []mcp.ToolOption {
+	args := []mcp.ToolOption{}
+
+	// Get security definitions from the document
+	components := c.parser.GetDocument().Components
+	if components == nil {
+		return nil
+	}
+	securitySchemes := components.SecuritySchemes
+	if len(securitySchemes) == 0 {
+		return nil
+	}
+
+	// Process each security requirement
+	for _, requirement := range securityRequirements {
+		for schemeName, scopes := range requirement {
+			schemeRef := securitySchemes[schemeName]
+			if schemeRef == nil || schemeRef.Value == nil {
+				continue
+			}
+
+			scheme := schemeRef.Value
+			switch scheme.Type {
+			case "apiKey":
+				args = append(args, mcp.WithString("auth_"+schemeName,
+					mcp.Description(fmt.Sprintf("API Key for %s authentication (in %s named '%s')",
+						schemeName, scheme.In, scheme.Name)),
+					mcp.Required()))
+			case "http":
+				switch scheme.Scheme {
+				case "basic":
+					args = append(args, mcp.WithString("auth_username",
+						mcp.Description("Username for Basic authentication"),
+						mcp.Required()))
+					args = append(args, mcp.WithString("auth_password",
+						mcp.Description("Password for Basic authentication"),
+						mcp.Required()))
+				case "bearer":
+					args = append(args, mcp.WithString("auth_token",
+						mcp.Description("Bearer token for authentication"),
+						mcp.Required()))
+				}
+			case "oauth2":
+				if len(scopes) > 0 {
+					scopeDesc := "OAuth2 token with scopes: " + strings.Join(scopes, ", ")
+					args = append(args, mcp.WithString("auth_oauth2_token",
+						mcp.Description(scopeDesc),
+						mcp.Required()))
+				} else {
+					args = append(args, mcp.WithString("auth_oauth2_token",
+						mcp.Description("OAuth2 token for authentication"),
+						mcp.Required()))
+				}
+			}
+		}
+	}
+
+	return args
 }
 
 // convertRequestBody converts an OpenAPI request body to MCP arguments
@@ -235,6 +373,27 @@ func (c *Converter) convertParameters(parameters openapi3.Parameters) ([]mcp.Too
 				t = PropertyTypeNumber
 			} else if schema.Type.Is("boolean") {
 				t = PropertyTypeBoolean
+			}
+
+			// Add enum values if present
+			if len(schema.Enum) > 0 {
+				enumValues := make([]string, 0, len(schema.Enum))
+				for _, val := range schema.Enum {
+					if strVal, ok := val.(string); ok {
+						enumValues = append(enumValues, strVal)
+					} else {
+						// Convert non-string values to string
+						enumValues = append(enumValues, fmt.Sprintf("%v", val))
+					}
+				}
+				if len(enumValues) > 0 {
+					propertyOptions = append(propertyOptions, mcp.Enum(enumValues...))
+				}
+			}
+
+			// Add example if present
+			if schema.Example != nil {
+				propertyOptions = append(propertyOptions, mcp.DefaultString(fmt.Sprintf("%v", schema.Example)))
 			}
 		}
 
@@ -512,11 +671,20 @@ func (c *Converter) createToolOption(t propertyType, name string, options ...mcp
 
 // getDescription returns a description for an operation
 func getDescription(operation *openapi3.Operation) string {
+	var parts []string
+
 	if operation.Summary != "" {
-		if operation.Description != "" {
-			return fmt.Sprintf("%s - %s", operation.Summary, operation.Description)
-		}
-		return operation.Summary
+		parts = append(parts, operation.Summary)
 	}
-	return operation.Description
+
+	if operation.Description != "" {
+		parts = append(parts, operation.Description)
+	}
+
+	// Add deprecated notice if applicable
+	if operation.Deprecated {
+		parts = append(parts, "WARNING: This operation is deprecated.")
+	}
+
+	return strings.Join(parts, "\n\n")
 }
