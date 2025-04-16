@@ -17,5 +17,5 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to convert OpenAPI to MCP: %v", err)
 	}
-	server.NewSSEServer(s).Start("127.0.0.1:3001")
+	server.NewSSEServer(s).Start("0.0.0.0:3001")
 }
