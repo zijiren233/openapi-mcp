@@ -77,8 +77,11 @@ func (c *Converter) Convert() (*server.MCPServer, error) {
 func newHandler(server *openapi3.Server, path, method string, operation *openapi3.Operation) (server.ToolHandlerFunc, error) {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		arg := getArgs(request.Params.Arguments)
+		if arg.ServerAddr == "" {
+			arg.ServerAddr = server.URL
+		}
 		fmt.Printf("arg: %+v\n", arg)
-		return nil, nil
+		return mcp.NewToolResultText("success"), nil
 	}, nil
 }
 
@@ -89,7 +92,7 @@ type Args struct {
 	AuthPassword    string
 	AuthOAuth2Token string
 	Headers         map[string]string
-	Body            map[string]interface{}
+	Body            any
 	Query           map[string]string
 	Path            map[string]string
 }
@@ -97,7 +100,6 @@ type Args struct {
 func getArgs(args map[string]interface{}) Args {
 	arg := Args{
 		Headers: make(map[string]string),
-		Body:    make(map[string]interface{}),
 		Query:   make(map[string]string),
 		Path:    make(map[string]string),
 	}
@@ -118,8 +120,8 @@ func getArgs(args map[string]interface{}) Args {
 			default:
 				arg.AuthToken = v.(string)
 			}
-		case strings.HasPrefix(k, "body|"):
-			arg.Body[strings.TrimPrefix(k, "body|")] = v
+		case k == "body":
+			arg.Body = v
 		case strings.HasPrefix(k, "query|"):
 			arg.Query[strings.TrimPrefix(k, "query|")] = v.(string)
 		case strings.HasPrefix(k, "path|"):
@@ -191,7 +193,16 @@ func (c *Converter) convertOperation(path, method string, operation *openapi3.Op
 		args = append(args, mcp.WithString("openapi|server_addr",
 			mcp.Description("Server address to connect to"),
 			mcp.Required()))
-	} else if len(servers) != 1 {
+	} else if len(servers) == 1 {
+		serverUrls := make([]string, 0, len(servers))
+		for _, server := range servers {
+			serverUrls = append(serverUrls, server.URL)
+		}
+		args = append(args, mcp.WithString("openapi|server_addr",
+			mcp.Description("Server address to connect to"),
+			mcp.DefaultString(servers[0].URL),
+			mcp.Enum(serverUrls...)))
+	} else {
 		serverUrls := make([]string, 0, len(servers))
 		for _, server := range servers {
 			serverUrls = append(serverUrls, server.URL)
@@ -345,7 +356,7 @@ func (c *Converter) convertSecurityRequirements(securityRequirements openapi3.Se
 func (c *Converter) convertRequestBody(requestBody *openapi3.RequestBody) ([]mcp.ToolOption, error) {
 	args := []mcp.ToolOption{}
 
-	for contentType, mediaType := range requestBody.Content {
+	for _, mediaType := range requestBody.Content {
 		if mediaType.Schema == nil || mediaType.Schema.Value == nil {
 			continue
 		}
@@ -382,7 +393,7 @@ func (c *Converter) convertRequestBody(requestBody *openapi3.RequestBody) ([]mcp
 		}
 
 		// Add content type as part of the parameter name
-		paramName := "body|" + contentType
+		paramName := "body"
 		args = append(args, c.createToolOption(t, paramName, propertyOptions...))
 	}
 
