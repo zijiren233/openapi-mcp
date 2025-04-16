@@ -1,7 +1,6 @@
-package main
+package convert
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -56,7 +55,7 @@ func (p *Parser) Parse(data []byte) error {
 
 func (p *Parser) ParseV2(data []byte) error {
 	var doc2 openapi2.T
-	err := json.Unmarshal(data, &doc2)
+	err := doc2.UnmarshalJSON(data)
 	if err != nil {
 		return fmt.Errorf("failed to parse OpenAPI document: %w", err)
 	}

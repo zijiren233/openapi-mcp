@@ -1,10 +1,14 @@
-package main
+package convert
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -12,18 +16,20 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-type ConvertOptions struct {
+type Options struct {
+	ServerName     string
+	Version        string
 	ToolNamePrefix string
 }
 
 // Converter represents an OpenAPI to MCP converter
 type Converter struct {
 	parser  *Parser
-	options ConvertOptions
+	options Options
 }
 
 // NewConverter creates a new OpenAPI to MCP converter
-func NewConverter(parser *Parser, options ConvertOptions) *Converter {
+func NewConverter(parser *Parser, options Options) *Converter {
 	return &Converter{
 		parser:  parser,
 		options: options,
@@ -41,10 +47,17 @@ func (c *Converter) Convert() (*server.MCPServer, error) {
 		return nil, errors.New("no info found in OpenAPI document")
 	}
 
+	if c.options.ServerName == "" {
+		c.options.ServerName = info.Title
+	}
+	if c.options.Version == "" {
+		c.options.Version = info.Version
+	}
+
 	// Create the MCP configuration
 	mcpServer := server.NewMCPServer(
-		info.Title,
-		info.Version,
+		c.options.ServerName,
+		c.options.Version,
 	)
 
 	servers := c.parser.GetServers()
@@ -77,11 +90,103 @@ func (c *Converter) Convert() (*server.MCPServer, error) {
 func newHandler(server *openapi3.Server, path, method string, operation *openapi3.Operation) (server.ToolHandlerFunc, error) {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		arg := getArgs(request.Params.Arguments)
-		if arg.ServerAddr == "" {
-			arg.ServerAddr = server.URL
+
+		// Build the URL
+		serverURL := arg.ServerAddr
+		if serverURL == "" && server != nil {
+			serverURL = server.URL
 		}
-		fmt.Printf("arg: %+v\n", arg)
-		return mcp.NewToolResultText("success"), nil
+
+		// Replace path parameters
+		finalPath := path
+		for paramName, paramValue := range arg.Path {
+			finalPath = strings.ReplaceAll(finalPath, "{"+paramName+"}", fmt.Sprintf("%v", paramValue))
+		}
+
+		// Build the full URL with query parameters
+		fullURL, err := url.JoinPath(serverURL, finalPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to join URL path %s: %w", fullURL, err)
+		}
+		parsedURL, err := url.Parse(fullURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse URL %s: %w", fullURL, err)
+		}
+
+		// Add query parameters
+		if len(arg.Query) > 0 {
+			q := parsedURL.Query()
+			for key, value := range arg.Query {
+				q.Add(key, fmt.Sprintf("%v", value))
+			}
+			parsedURL.RawQuery = q.Encode()
+		}
+
+		// Create the request body if needed
+		var reqBody io.Reader
+		if arg.Body != nil {
+			bodyBytes, err := json.Marshal(arg.Body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal request body: %w", err)
+			}
+			reqBody = bytes.NewBuffer(bodyBytes)
+		}
+
+		// Create the HTTP request
+		httpReq, err := http.NewRequestWithContext(ctx, strings.ToUpper(method), parsedURL.String(), reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		}
+
+		// Add headers
+		for key, value := range arg.Headers {
+			httpReq.Header.Add(key, fmt.Sprintf("%v", value))
+		}
+
+		// Set content type for requests with body
+		if arg.Body != nil {
+			httpReq.Header.Set("Content-Type", "application/json")
+		}
+
+		// Add authentication if provided
+		if arg.AuthToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+arg.AuthToken)
+		} else if arg.AuthUsername != "" && arg.AuthPassword != "" {
+			httpReq.SetBasicAuth(arg.AuthUsername, arg.AuthPassword)
+		} else if arg.AuthOAuth2Token != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+arg.AuthOAuth2Token)
+		}
+
+		// For form data
+		if len(arg.Forms) > 0 {
+			formData := url.Values{}
+			for key, value := range arg.Forms {
+				switch value := value.(type) {
+				case map[string]any:
+					jsonStr, err := json.Marshal(value)
+					if err != nil {
+						return nil, err
+					}
+					formData.Add(key, string(jsonStr))
+				default:
+					formData.Add(key, fmt.Sprintf("%v", value))
+				}
+			}
+			httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			httpReq.Body = io.NopCloser(strings.NewReader(formData.Encode()))
+		}
+
+		resp, err := http.DefaultClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		result, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read response error: %w", err)
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("status code: %d\nresponse body: %s", resp.StatusCode, result)), nil
 	}, nil
 }
 
