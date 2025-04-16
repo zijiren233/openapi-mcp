@@ -42,10 +42,16 @@ func (c *Converter) Convert() (*server.MCPServer, error) {
 	}
 
 	// Create the MCP configuration
-	server := server.NewMCPServer(
+	mcpServer := server.NewMCPServer(
 		info.Title,
 		info.Version,
 	)
+
+	servers := c.parser.GetServers()
+	var server *openapi3.Server
+	if len(servers) == 1 {
+		server = servers[0]
+	}
 
 	// Process each path and operation
 	for path, pathItem := range c.parser.GetPaths().Map() {
@@ -56,13 +62,73 @@ func (c *Converter) Convert() (*server.MCPServer, error) {
 				return nil, fmt.Errorf("failed to convert operation %s %s: %w", method, path, err)
 			}
 
-			server.AddTool(*tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return nil, nil
-			})
+			handler, err := newHandler(server, path, method, operation)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create handler for operation %s %s: %w", method, path, err)
+			}
+
+			mcpServer.AddTool(*tool, handler)
 		}
 	}
 
-	return server, nil
+	return mcpServer, nil
+}
+
+func newHandler(server *openapi3.Server, path, method string, operation *openapi3.Operation) (server.ToolHandlerFunc, error) {
+	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		arg := getArgs(request.Params.Arguments)
+		fmt.Printf("arg: %+v\n", arg)
+		return nil, nil
+	}, nil
+}
+
+type Args struct {
+	ServerAddr      string
+	AuthToken       string
+	AuthUsername    string
+	AuthPassword    string
+	AuthOAuth2Token string
+	Headers         map[string]string
+	Body            map[string]interface{}
+	Query           map[string]string
+	Path            map[string]string
+}
+
+func getArgs(args map[string]interface{}) Args {
+	arg := Args{
+		Headers: make(map[string]string),
+		Body:    make(map[string]interface{}),
+		Query:   make(map[string]string),
+		Path:    make(map[string]string),
+	}
+	for k, v := range args {
+		switch {
+		case strings.HasPrefix(k, "openapi|"):
+			switch strings.TrimPrefix(k, "openapi|") {
+			case "server_addr":
+				arg.ServerAddr = v.(string)
+			case "auth_token":
+				arg.AuthToken = v.(string)
+			case "auth_username":
+				arg.AuthUsername = v.(string)
+			case "auth_password":
+				arg.AuthPassword = v.(string)
+			case "auth_oauth2_token":
+				arg.AuthOAuth2Token = v.(string)
+			default:
+				arg.AuthToken = v.(string)
+			}
+		case strings.HasPrefix(k, "body|"):
+			arg.Body[strings.TrimPrefix(k, "body|")] = v
+		case strings.HasPrefix(k, "query|"):
+			arg.Query[strings.TrimPrefix(k, "query|")] = v.(string)
+		case strings.HasPrefix(k, "path|"):
+			arg.Path[strings.TrimPrefix(k, "path|")] = v.(string)
+		case strings.HasPrefix(k, "header|"):
+			arg.Headers[strings.TrimPrefix(k, "header|")] = v.(string)
+		}
+	}
+	return arg
 }
 
 // getOperations returns a map of HTTP method to operation
@@ -122,7 +188,7 @@ func (c *Converter) convertOperation(path, method string, operation *openapi3.Op
 	// Add server address parameter
 	servers := c.parser.GetServers()
 	if len(servers) == 0 {
-		args = append(args, mcp.WithString("openapi_server_addr",
+		args = append(args, mcp.WithString("openapi|server_addr",
 			mcp.Description("Server address to connect to"),
 			mcp.Required()))
 	} else if len(servers) != 1 {
@@ -130,7 +196,7 @@ func (c *Converter) convertOperation(path, method string, operation *openapi3.Op
 		for _, server := range servers {
 			serverUrls = append(serverUrls, server.URL)
 		}
-		args = append(args, mcp.WithString("openapi_server_addr",
+		args = append(args, mcp.WithString("openapi|server_addr",
 			mcp.Description("Server address to connect to"),
 			mcp.Required(),
 			mcp.Enum(serverUrls...)))
@@ -175,8 +241,6 @@ func (c *Converter) generateResponseDescription(responses openapi3.Responses) st
 		response := responseRef.Value
 		desc := fmt.Sprintf("- status: %s, description: %s", code, *response.Description)
 
-		fmt.Printf("response: %+v\n", response)
-
 		rawSchema, ok := response.Extensions["schema"].(map[string]interface{})
 		if ok && len(rawSchema) > 0 {
 			jsonStr, err := json.Marshal(rawSchema)
@@ -189,7 +253,7 @@ func (c *Converter) generateResponseDescription(responses openapi3.Responses) st
 				continue
 			}
 
-			property := c.processSchemaProperty(&schema)
+			property := c.processSchemaProperty(&schema, make(map[string]bool))
 			str, err := json.Marshal(property)
 			if err != nil {
 				continue
@@ -200,7 +264,7 @@ func (c *Converter) generateResponseDescription(responses openapi3.Responses) st
 		if len(response.Content) > 0 {
 			for contentType, mediaType := range response.Content {
 				if mediaType.Schema != nil && mediaType.Schema.Value != nil {
-					property := c.processSchemaProperty(mediaType.Schema.Value)
+					property := c.processSchemaProperty(mediaType.Schema.Value, make(map[string]bool))
 					str, err := json.Marshal(property)
 					if err != nil {
 						continue
@@ -241,32 +305,32 @@ func (c *Converter) convertSecurityRequirements(securityRequirements openapi3.Se
 			scheme := schemeRef.Value
 			switch scheme.Type {
 			case "apiKey":
-				args = append(args, mcp.WithString("auth_"+schemeName,
+				args = append(args, mcp.WithString("openapi|auth_"+schemeName,
 					mcp.Description(fmt.Sprintf("API Key for %s authentication (in %s named '%s')",
 						schemeName, scheme.In, scheme.Name)),
 					mcp.Required()))
 			case "http":
 				switch scheme.Scheme {
 				case "basic":
-					args = append(args, mcp.WithString("auth_username",
+					args = append(args, mcp.WithString("openapi|auth_username",
 						mcp.Description("Username for Basic authentication"),
 						mcp.Required()))
-					args = append(args, mcp.WithString("auth_password",
+					args = append(args, mcp.WithString("openapi|auth_password",
 						mcp.Description("Password for Basic authentication"),
 						mcp.Required()))
 				case "bearer":
-					args = append(args, mcp.WithString("auth_token",
+					args = append(args, mcp.WithString("openapi|auth_token",
 						mcp.Description("Bearer token for authentication"),
 						mcp.Required()))
 				}
 			case "oauth2":
 				if len(scopes) > 0 {
 					scopeDesc := "OAuth2 token with scopes: " + strings.Join(scopes, ", ")
-					args = append(args, mcp.WithString("auth_oauth2_token",
+					args = append(args, mcp.WithString("openapi|auth_oauth2_token",
 						mcp.Description(scopeDesc),
 						mcp.Required()))
 				} else {
-					args = append(args, mcp.WithString("auth_oauth2_token",
+					args = append(args, mcp.WithString("openapi|auth_oauth2_token",
 						mcp.Description("OAuth2 token for authentication"),
 						mcp.Required()))
 				}
@@ -301,10 +365,10 @@ func (c *Converter) convertRequestBody(requestBody *openapi3.RequestBody) ([]mcp
 		if schema.Type != nil {
 			if schema.Type.Is("array") && schema.Items != nil && schema.Items.Value != nil {
 				t = PropertyTypeArray
-				item := c.processSchemaItems(schema.Items.Value)
+				item := c.processSchemaItems(schema.Items.Value, make(map[string]bool))
 				propertyOptions = append(propertyOptions, mcp.Items(item))
 			} else if schema.Type.Is("object") || len(schema.Properties) > 0 {
-				obj := c.processSchemaProperties(schema)
+				obj := c.processSchemaProperties(schema, make(map[string]bool))
 				propertyOptions = append(propertyOptions, mcp.Properties(obj))
 			} else if schema.Type.Is("string") {
 				t = PropertyTypeString
@@ -361,11 +425,11 @@ func (c *Converter) convertParameters(parameters openapi3.Parameters) ([]mcp.Too
 			// Determine property type and add specific options
 			if schema.Type.Is("array") && schema.Items != nil && schema.Items.Value != nil {
 				t = PropertyTypeArray
-				item := c.processSchemaItems(schema.Items.Value)
+				item := c.processSchemaItems(schema.Items.Value, make(map[string]bool))
 				propertyOptions = append(propertyOptions, mcp.Items(item))
 			} else if schema.Type.Is("object") && len(schema.Properties) > 0 {
 				t = PropertyTypeObject
-				obj := c.processSchemaProperties(schema)
+				obj := c.processSchemaProperties(schema, make(map[string]bool))
 				propertyOptions = append(propertyOptions, mcp.Properties(obj))
 			} else if schema.Type.Is("integer") {
 				t = PropertyTypeInteger
@@ -405,7 +469,7 @@ func (c *Converter) convertParameters(parameters openapi3.Parameters) ([]mcp.Too
 }
 
 // processSchemaItems processes schema items for array types
-func (c *Converter) processSchemaItems(schema *openapi3.Schema) map[string]interface{} {
+func (c *Converter) processSchemaItems(schema *openapi3.Schema, visited map[string]bool) map[string]interface{} {
 	item := make(map[string]interface{})
 
 	if schema.Type != nil {
@@ -421,7 +485,7 @@ func (c *Converter) processSchemaItems(schema *openapi3.Schema) map[string]inter
 		properties := make(map[string]interface{})
 		for propName, propRef := range schema.Properties {
 			if propRef.Value != nil {
-				properties[propName] = c.processSchemaProperty(propRef.Value)
+				properties[propName] = c.processSchemaProperty(propRef.Value, visited)
 			}
 		}
 		item["properties"] = properties
@@ -429,19 +493,19 @@ func (c *Converter) processSchemaItems(schema *openapi3.Schema) map[string]inter
 
 	// Handle reference if this is a reference to another schema
 	if schema.Items != nil && schema.Items.Value != nil {
-		item["items"] = c.processSchemaItems(schema.Items.Value)
+		item["items"] = c.processSchemaItems(schema.Items.Value, visited)
 	}
 
 	return item
 }
 
 // processSchemaProperties processes schema properties for object types
-func (c *Converter) processSchemaProperties(schema *openapi3.Schema) map[string]interface{} {
+func (c *Converter) processSchemaProperties(schema *openapi3.Schema, visited map[string]bool) map[string]interface{} {
 	obj := make(map[string]interface{})
 
 	for propName, propRef := range schema.Properties {
 		if propRef.Value != nil {
-			obj[propName] = c.processSchemaProperty(propRef.Value)
+			obj[propName] = c.processSchemaProperty(propRef.Value, visited)
 		}
 	}
 
@@ -449,8 +513,28 @@ func (c *Converter) processSchemaProperties(schema *openapi3.Schema) map[string]
 }
 
 // processSchemaProperty processes a single schema property
-func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]interface{} {
+func (c *Converter) processSchemaProperty(schema *openapi3.Schema, visited map[string]bool) map[string]interface{} {
 	property := make(map[string]interface{})
+
+	// Check for circular references
+	if schema.Title != "" {
+		refKey := schema.Title
+		if visited[refKey] {
+			// We've seen this schema before, return a simplified reference to avoid circular references
+			return map[string]interface{}{
+				"type":        "reference",
+				"description": "Circular reference to " + refKey,
+				"title":       refKey,
+			}
+		}
+		visited[refKey] = true
+		// Create a copy of the visited map to avoid cross-contamination between different branches
+		visitedCopy := make(map[string]bool)
+		for k, v := range visited {
+			visitedCopy[k] = v
+		}
+		visited = visitedCopy
+	}
 
 	if schema.Type != nil {
 		property["type"] = schema.Type
@@ -481,7 +565,7 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 		oneOf := make([]interface{}, 0, len(schema.OneOf))
 		for _, schemaRef := range schema.OneOf {
 			if schemaRef.Value != nil {
-				oneOf = append(oneOf, c.processSchemaProperty(schemaRef.Value))
+				oneOf = append(oneOf, c.processSchemaProperty(schemaRef.Value, visited))
 			}
 		}
 		if len(oneOf) > 0 {
@@ -493,7 +577,7 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 		anyOf := make([]interface{}, 0, len(schema.AnyOf))
 		for _, schemaRef := range schema.AnyOf {
 			if schemaRef.Value != nil {
-				anyOf = append(anyOf, c.processSchemaProperty(schemaRef.Value))
+				anyOf = append(anyOf, c.processSchemaProperty(schemaRef.Value, visited))
 			}
 		}
 		if len(anyOf) > 0 {
@@ -505,7 +589,7 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 		allOf := make([]interface{}, 0, len(schema.AllOf))
 		for _, schemaRef := range schema.AllOf {
 			if schemaRef.Value != nil {
-				allOf = append(allOf, c.processSchemaProperty(schemaRef.Value))
+				allOf = append(allOf, c.processSchemaProperty(schemaRef.Value, visited))
 			}
 		}
 		if len(allOf) > 0 {
@@ -514,7 +598,7 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 	}
 
 	if schema.Not != nil && schema.Not.Value != nil {
-		property["not"] = c.processSchemaProperty(schema.Not.Value)
+		property["not"] = c.processSchemaProperty(schema.Not.Value, visited)
 	}
 
 	// Boolean flags
@@ -588,7 +672,7 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 	if schema.AdditionalProperties.Has != nil {
 		property["additionalProperties"] = *schema.AdditionalProperties.Has
 	} else if schema.AdditionalProperties.Schema != nil && schema.AdditionalProperties.Schema.Value != nil {
-		property["additionalProperties"] = c.processSchemaProperty(schema.AdditionalProperties.Schema.Value)
+		property["additionalProperties"] = c.processSchemaProperty(schema.AdditionalProperties.Schema.Value, visited)
 	}
 
 	// Handle discriminator
@@ -606,7 +690,7 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 		nestedProps := make(map[string]interface{})
 		for propName, propRef := range schema.Properties {
 			if propRef.Value != nil {
-				nestedProps[propName] = c.processSchemaProperty(propRef.Value)
+				nestedProps[propName] = c.processSchemaProperty(propRef.Value, visited)
 			}
 		}
 		property["properties"] = nestedProps
@@ -614,7 +698,7 @@ func (c *Converter) processSchemaProperty(schema *openapi3.Schema) map[string]in
 
 	// Recursively process array items
 	if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil && schema.Items.Value != nil {
-		property["items"] = c.processSchemaItems(schema.Items.Value)
+		property["items"] = c.processSchemaItems(schema.Items.Value, visited)
 	}
 
 	// Handle external docs if present
