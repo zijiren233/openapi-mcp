@@ -91,20 +91,20 @@ type Args struct {
 	AuthUsername    string
 	AuthPassword    string
 	AuthOAuth2Token string
-	Headers         map[string]string
+	Headers         map[string]any
 	Body            any
 	Bodys           map[string]any
-	Query           map[string]string
-	Path            map[string]string
+	Query           map[string]any
+	Path            map[string]any
 	Forms           map[string]any
 }
 
 func getArgs(args map[string]interface{}) Args {
 	arg := Args{
 		Bodys:   make(map[string]any),
-		Headers: make(map[string]string),
-		Query:   make(map[string]string),
-		Path:    make(map[string]string),
+		Headers: make(map[string]any),
+		Query:   make(map[string]any),
+		Path:    make(map[string]any),
 		Forms:   make(map[string]any),
 	}
 	for k, v := range args {
@@ -129,11 +129,11 @@ func getArgs(args map[string]interface{}) Args {
 		case strings.HasPrefix(k, "body|"):
 			arg.Bodys[strings.TrimPrefix(k, "body|")] = v
 		case strings.HasPrefix(k, "query|"):
-			arg.Query[strings.TrimPrefix(k, "query|")] = v.(string)
+			arg.Query[strings.TrimPrefix(k, "query|")] = v
 		case strings.HasPrefix(k, "path|"):
-			arg.Path[strings.TrimPrefix(k, "path|")] = v.(string)
+			arg.Path[strings.TrimPrefix(k, "path|")] = v
 		case strings.HasPrefix(k, "header|"):
-			arg.Headers[strings.TrimPrefix(k, "header|")] = v.(string)
+			arg.Headers[strings.TrimPrefix(k, "header|")] = v
 		case strings.HasPrefix(k, "formData|"):
 			arg.Forms[strings.TrimPrefix(k, "formData|")] = v
 		}
