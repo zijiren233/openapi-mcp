@@ -93,7 +93,6 @@ type Args struct {
 	AuthOAuth2Token string
 	Headers         map[string]any
 	Body            any
-	Bodys           map[string]any
 	Query           map[string]any
 	Path            map[string]any
 	Forms           map[string]any
@@ -101,7 +100,6 @@ type Args struct {
 
 func getArgs(args map[string]interface{}) Args {
 	arg := Args{
-		Bodys:   make(map[string]any),
 		Headers: make(map[string]any),
 		Query:   make(map[string]any),
 		Path:    make(map[string]any),
@@ -126,8 +124,6 @@ func getArgs(args map[string]interface{}) Args {
 			}
 		case k == "body":
 			arg.Body = v
-		case strings.HasPrefix(k, "body|"):
-			arg.Bodys[strings.TrimPrefix(k, "body|")] = v
 		case strings.HasPrefix(k, "query|"):
 			arg.Query[strings.TrimPrefix(k, "query|")] = v
 		case strings.HasPrefix(k, "path|"):
@@ -401,8 +397,7 @@ func (c *Converter) convertRequestBody(requestBody *openapi3.RequestBody) ([]mcp
 		}
 
 		// Add content type as part of the parameter name
-		paramName := "body"
-		args = append(args, c.createToolOption(t, paramName, propertyOptions...))
+		args = append(args, c.createToolOption(t, "body", propertyOptions...))
 	}
 
 	return args, nil
@@ -481,7 +476,11 @@ func (c *Converter) convertParameters(parameters openapi3.Parameters) ([]mcp.Too
 		}
 
 		// Add the parameter based on its type
-		args = append(args, c.createToolOption(t, param.In+"|"+param.Name, propertyOptions...))
+		if param.In == "body" {
+			args = append(args, c.createToolOption(t, param.In, propertyOptions...))
+		} else {
+			args = append(args, c.createToolOption(t, param.In+"|"+param.Name, propertyOptions...))
+		}
 	}
 
 	return args, nil
